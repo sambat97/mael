@@ -8,7 +8,6 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -16,19 +15,22 @@ jobs:
         with:
           node-version: 20
 
-      # Kalau pakai dependency (postal-mime), pastikan ada package.json
       - name: Install dependencies (optional)
         run: |
           if [ -f package.json ]; then
             npm install
           fi
 
-      - name: Apply schema to D1 (remote)
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: d1 execute mail_portal --file=./schema.sql --remote --yes
+      # ✅ Ini yang bikin errornya kebaca
+      - name: Apply schema to D1 (remote) - DEBUG
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_LOG: debug
+        run: |
+          npx wrangler@3 --version
+          npx wrangler@3 d1 list
+          npx wrangler@3 d1 execute mail_portal --file=./schema.sql --remote
 
       - name: Deploy Worker
         uses: cloudflare/wrangler-action@v3

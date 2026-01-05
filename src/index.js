@@ -13,18 +13,37 @@ import PostalMime from "postal-mime";
 
 const encoder = new TextEncoder();
 
+// -------------------- Security/Hashing constants --------------------
+const PBKDF2_MAX_ITERS = 100000; // Cloudflare Workers WebCrypto limit
+const PBKDF2_MIN_ITERS = 10000;  // keep a sensible floor
+
+// Cache (per isolate) whether DB has users.pass_iters column
+let USERS_HAS_PASS_ITERS = null;
+
 // -------------------- Response helpers --------------------
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8", ...headers },
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      ...headers,
+    },
   });
 }
 
 function html(body, status = 200, headers = {}) {
   return new Response(body, {
     status,
-    headers: { "content-type": "text/html; charset=utf-8", ...headers },
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      ...headers,
+    },
   });
 }
 
@@ -51,13 +70,19 @@ function nowSec() {
   return Math.floor(Date.now() / 1000);
 }
 
+function clampPbkdf2Iters(n) {
+  const x = safeInt(n, PBKDF2_MAX_ITERS);
+  return Math.min(PBKDF2_MAX_ITERS, Math.max(PBKDF2_MIN_ITERS, x));
+}
+
 function pbkdf2Iters(env) {
-  // Turunin default biar signup/login gak timeout -> "bad json"
-  // Bisa kamu set di vars: PBKDF2_ITERS=120000 (atau 150000)
-  return safeInt(env.PBKDF2_ITERS, 120000);
+  // IMPORTANT: Workers WebCrypto max 100000, jadi kita clamp.
+  // Env PBKDF2_ITERS boleh diset, tapi tetap tidak bisa > 100000.
+  return clampPbkdf2Iters(env.PBKDF2_ITERS ?? PBKDF2_MAX_ITERS);
 }
 
 function base64Url(bytes) {
+  // small arrays only (we only use for salts/tokens/hashes) -> safe
   const bin = String.fromCharCode(...bytes);
   const b64 = btoa(bin);
   return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
@@ -78,6 +103,16 @@ async function sha256Base64Url(inputBytes) {
 }
 
 async function pbkdf2HashBase64Url(password, saltBytes, iterations) {
+  // Fail-fast bila someone tries to pass > max
+  const it = safeInt(iterations, 0);
+  if (it > PBKDF2_MAX_ITERS) {
+    const err = new Error(
+      `PBKDF2 iterations too high for Workers (max ${PBKDF2_MAX_ITERS}, got ${it}).`
+    );
+    err.name = "NotSupportedError";
+    throw err;
+  }
+
   const keyMaterial = await crypto.subtle.importKey(
     "raw",
     encoder.encode(password),
@@ -91,7 +126,7 @@ async function pbkdf2HashBase64Url(password, saltBytes, iterations) {
       name: "PBKDF2",
       hash: "SHA-256",
       salt: saltBytes,
-      iterations,
+      iterations: it,
     },
     keyMaterial,
     256
@@ -111,7 +146,13 @@ function getCookie(request, name) {
 }
 
 function setCookieHeader(name, value, opts = {}) {
-  const { httpOnly = true, secure = true, sameSite = "Lax", path = "/", maxAge } = opts;
+  const {
+    httpOnly = true,
+    secure = true,
+    sameSite = "Lax",
+    path = "/",
+    maxAge,
+  } = opts;
 
   let c = `${name}=${value}; Path=${path}; SameSite=${sameSite}`;
   if (httpOnly) c += "; HttpOnly";
@@ -135,7 +176,67 @@ function validLocalPart(local) {
   return /^[a-z0-9][a-z0-9._+-]{0,63}$/.test(local);
 }
 
-// -------------------- UI Template (lebih rapi + mobile) --------------------
+async function usersHasPassIters(env) {
+  if (USERS_HAS_PASS_ITERS !== null) return USERS_HAS_PASS_ITERS;
+
+  try {
+    const res = await env.DB.prepare(`PRAGMA table_info(users)`).all();
+    USERS_HAS_PASS_ITERS = (res.results || []).some((r) => r?.name === "pass_iters");
+  } catch {
+    USERS_HAS_PASS_ITERS = false;
+  }
+  return USERS_HAS_PASS_ITERS;
+}
+
+// -------------------- UI: Brand + Template --------------------
+const LOGO_SVG = `
+<svg viewBox="0 0 64 64" width="34" height="34" aria-hidden="true" focusable="false">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7dd3fc"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+    <filter id="s" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="6" stdDeviation="6" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <circle cx="32" cy="32" r="26" fill="url(#g)" filter="url(#s)"/>
+  <circle cx="32" cy="32" r="24" fill="rgba(11,15,20,0.35)"/>
+  <path d="M22 40V24h6c6 0 10 3 10 8s-4 8-10 8h-6zm6-4h1c3.6 0 5.8-1.8 5.8-4s-2.2-4-5.8-4h-1v8z"
+        fill="#e6edf3" opacity="0.95"/>
+  <path d="M42 24h4v12c0 2.6-1.5 4.2-4.3 4.2-1 0-2.2-.2-3-.6l.7-3.4c.5.2 1.1.3 1.6.3 1 0 1-.5 1-1.1V24z"
+        fill="#e6edf3" opacity="0.95"/>
+</svg>
+`;
+
+const FAVICON_DATA = encodeURIComponent(`
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7dd3fc"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+  </defs>
+  <circle cx="32" cy="32" r="28" fill="url(#g)"/>
+  <text x="32" y="40" text-anchor="middle" font-size="26" font-family="Arial" fill="#0b0f14">OL</text>
+</svg>
+`);
+
+function headerHtml({ badge, subtitle, rightHtml = "" }) {
+  return `
+  <header class="hdr">
+    <div class="brand">
+      <div class="logo">${LOGO_SVG}</div>
+      <div class="brandText">
+        <div class="brandName">Org_Lemah</div>
+        <div class="brandSub">${subtitle || ""}</div>
+      </div>
+      ${badge ? `<span class="pill">${badge}</span>` : ""}
+    </div>
+    <div class="hdrRight">${rightHtml}</div>
+  </header>`;
+}
+
 function pageTemplate(title, body, extraHead = "") {
   return `<!doctype html>
 <html lang="id">
@@ -143,6 +244,20 @@ function pageTemplate(title, body, extraHead = "") {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>${title}</title>
+  <meta name="theme-color" content="#0b0f14">
+  <link rel="icon" href="data:image/svg+xml,${FAVICON_DATA}">
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'self';
+    base-uri 'none';
+    object-src 'none';
+    form-action 'self';
+    frame-ancestors 'none';
+    img-src 'self' data: https:;
+    style-src 'self' 'unsafe-inline';
+    script-src 'self' 'unsafe-inline';
+    connect-src 'self';
+    frame-src 'self';
+  ">
   ${extraHead}
   <style>
     :root{
@@ -154,80 +269,130 @@ function pageTemplate(title, body, extraHead = "") {
       --muted:#93a4b8;
       --brand:#7dd3fc;
       --danger:#ef4444;
+      --ok:#22c55e;
     }
     *{box-sizing:border-box}
     body{
-      font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
       margin:0;
-      background: radial-gradient(1200px 600px at 20% -10%, rgba(125,211,252,.12), transparent 60%),
-                  radial-gradient(900px 500px at 90% 0%, rgba(99,102,241,.10), transparent 55%),
-                  var(--bg);
+      background:
+        radial-gradient(1200px 600px at 20% -10%, rgba(125,211,252,.13), transparent 60%),
+        radial-gradient(900px 500px at 90% 0%, rgba(99,102,241,.12), transparent 55%),
+        radial-gradient(700px 400px at 30% 110%, rgba(34,197,94,.07), transparent 55%),
+        var(--bg);
       color:var(--text);
+      min-height:100vh;
     }
     a{color:var(--brand);text-decoration:none}
-    a:hover{opacity:.9;text-decoration:underline}
-    .wrap{max-width:980px;margin:0 auto;padding:22px}
-    .card{
-      background: linear-gradient(180deg, rgba(255,255,255,.03), transparent 35%), var(--card);
-      border:1px solid var(--border);
-      border-radius:16px;
-      padding:16px;
-      margin:14px 0;
-      box-shadow: 0 10px 30px rgba(0,0,0,.25);
+    a:hover{opacity:.92;text-decoration:underline}
+
+    .wrap{max-width:980px;margin:0 auto;padding:18px}
+    .hdr{
+      display:flex;justify-content:space-between;align-items:center;
+      gap:14px; padding:12px 0 4px;
     }
+    .brand{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+    .logo{display:flex;align-items:center}
+    .brandText{display:flex;flex-direction:column;line-height:1.05}
+    .brandName{font-weight:800;letter-spacing:.2px}
+    .brandSub{color:var(--muted);font-size:12.5px;margin-top:3px}
+    .hdrRight{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+
+    .card{
+      background: linear-gradient(180deg, rgba(255,255,255,.035), transparent 40%), var(--card);
+      border:1px solid rgba(34,49,74,.9);
+      border-radius:18px;
+      padding:16px;
+      margin:12px 0;
+      box-shadow: 0 10px 30px rgba(0,0,0,.28);
+      overflow:hidden;
+    }
+
     input,button,select,textarea{font:inherit}
     label{display:block;margin-bottom:6px;color:var(--muted);font-size:13px}
     input,select,textarea{
       width:100%;
       padding:11px 12px;
       border-radius:12px;
-      border:1px solid var(--border);
+      border:1px solid rgba(34,49,74,.95);
       background: var(--card2);
       color:var(--text);
       outline:none;
     }
     input:focus,select:focus,textarea:focus{
-      border-color: rgba(125,211,252,.65);
+      border-color: rgba(125,211,252,.7);
       box-shadow: 0 0 0 4px rgba(125,211,252,.12);
     }
+
     button{
       padding:10px 12px;
       border-radius:12px;
-      border:1px solid var(--border);
+      border:1px solid rgba(34,49,74,.95);
       background: rgba(125,211,252,.12);
       color:var(--text);
       cursor:pointer;
-      transition: transform .05s ease, background .15s ease;
+      transition: transform .06s ease, background .15s ease, border-color .15s ease;
       white-space:nowrap;
     }
-    button:hover{background: rgba(125,211,252,.18)}
+    button:hover{background: rgba(125,211,252,.18); border-color: rgba(125,211,252,.25)}
     button:active{transform: translateY(1px)}
     .btn-primary{
-      background: linear-gradient(135deg, rgba(125,211,252,.25), rgba(99,102,241,.18));
+      background: linear-gradient(135deg, rgba(125,211,252,.28), rgba(99,102,241,.18));
       border-color: rgba(125,211,252,.35);
     }
-    .muted{color:var(--muted)}
-    .top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}
-    .pill{
-      display:inline-block;padding:4px 10px;border-radius:999px;
-      border:1px solid var(--border);background: rgba(255,255,255,.02);
-      color:var(--muted);font-size:12px
+    .btn-ghost{
+      background: rgba(255,255,255,.03);
     }
+    .muted{color:var(--muted)}
+    .pill{
+      display:inline-flex;align-items:center;gap:6px;
+      padding:5px 10px;border-radius:999px;
+      border:1px solid rgba(34,49,74,.95);
+      background: rgba(255,255,255,.03);
+      color:var(--muted);
+      font-size:12px;
+    }
+
     .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
     .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
-    pre{margin:10px 0 0;white-space:pre-wrap}
+
+    pre{margin:10px 0 0;white-space:pre-wrap;word-break:break-word}
     .danger{
       border-color: rgba(239,68,68,.45);
       background: rgba(239,68,68,.10);
     }
-    .danger:hover{background: rgba(239,68,68,.14)}
-    table{width:100%;border-collapse:collapse}
-    th,td{padding:10px;border-bottom:1px solid var(--border);text-align:left;vertical-align:top}
-    .hr{border:0;border-top:1px solid var(--border);margin:12px 0}
+    .danger:hover{background: rgba(239,68,68,.14); border-color: rgba(239,68,68,.55)}
+    .hr{border:0;border-top:1px solid rgba(34,49,74,.95);margin:12px 0}
+
+    .split{
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap:12px;
+      align-items:start;
+    }
+    .listItem{
+      padding:10px 0;
+      border-bottom:1px solid rgba(34,49,74,.95);
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+      flex-wrap:wrap;
+    }
+    .kbd{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+      padding:2px 8px;
+      border-radius:999px;
+      border:1px solid rgba(34,49,74,.95);
+      background: rgba(255,255,255,.03);
+      color: var(--muted);
+    }
+
     @media (max-width: 760px){
       .wrap{padding:14px}
-      .top{flex-direction:column;align-items:flex-start}
-      .row,.row3{grid-template-columns:1fr}
+      .hdr{flex-direction:column;align-items:flex-start}
+      .row,.row3,.split{grid-template-columns:1fr}
     }
   </style>
 </head>
@@ -245,10 +410,11 @@ const PAGES = {
     return pageTemplate(
       "Login",
       `
-      <div class="top">
-        <div><b>Mail Portal</b> <span class="pill">Login</span></div>
-        <div class="muted">Domain alias + inbox</div>
-      </div>
+      ${headerHtml({
+        badge: "Login",
+        subtitle: "Mail Portal • Domain alias + inbox",
+        rightHtml: `<a class="pill" href="/signup">Buat akun</a>`,
+      })}
 
       <div class="card">
         <div class="row">
@@ -261,9 +427,9 @@ const PAGES = {
             <input id="pw" type="password" placeholder="••••••••" autocomplete="current-password" />
           </div>
         </div>
+
         <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
           <button class="btn-primary" onclick="login()">Login</button>
-          <a href="/signup">Buat akun</a>
           <a href="/reset" class="muted">Lupa password?</a>
         </div>
         <pre id="out" class="muted"></pre>
@@ -277,7 +443,6 @@ const PAGES = {
             return { ok:false, error: 'Server returned non-JSON ('+r.status+'). ' + (t ? t.slice(0,200) : '') };
           }
         }
-
         async function login(){
           const id = document.getElementById('id').value.trim();
           const pw = document.getElementById('pw').value;
@@ -301,10 +466,11 @@ const PAGES = {
     return pageTemplate(
       "Signup",
       `
-      <div class="top">
-        <div><b>Mail Portal</b> <span class="pill">Signup</span></div>
-        <div class="muted">Alias email: <b>@${domain}</b></div>
-      </div>
+      ${headerHtml({
+        badge: "Signup",
+        subtitle: "Buat akun • Alias email @" + domain,
+        rightHtml: `<a class="pill" href="/login">Login</a>`,
+      })}
 
       <div class="card">
         <div class="row">
@@ -317,13 +483,17 @@ const PAGES = {
             <input id="e" placeholder="sipar@gmail.com" autocomplete="email" />
           </div>
         </div>
+
         <div style="margin-top:12px">
           <label>Password</label>
           <input id="pw" type="password" placeholder="minimal 8 karakter" autocomplete="new-password" />
+          <div class="muted" style="margin-top:8px">
+            Alias kamu nanti akan berbentuk <span class="kbd">nama@${domain}</span>
+          </div>
         </div>
+
         <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
           <button class="btn-primary" onclick="signup()">Create account</button>
-          <a href="/login" class="muted">Sudah punya akun?</a>
         </div>
         <pre id="out" class="muted"></pre>
       </div>
@@ -336,7 +506,6 @@ const PAGES = {
             return { ok:false, error: 'Server returned non-JSON ('+r.status+'). ' + (t ? t.slice(0,200) : '') };
           }
         }
-
         async function signup(){
           const username = document.getElementById('u').value.trim();
           const email = document.getElementById('e').value.trim();
@@ -361,17 +530,17 @@ const PAGES = {
     return pageTemplate(
       "Reset Password",
       `
-      <div class="top">
-        <div><b>Mail Portal</b> <span class="pill">Reset</span></div>
-        <div class="muted">Kirim link/token reset</div>
-      </div>
+      ${headerHtml({
+        badge: "Reset",
+        subtitle: "Kirim token reset / set password baru",
+        rightHtml: `<a class="pill" href="/login">Login</a>`,
+      })}
 
       <div class="card">
         <label>Email akun</label>
         <input id="e" placeholder="sipar@gmail.com" autocomplete="email" />
         <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
-          <button class="btn-primary" onclick="reqReset()">Kirim reset link</button>
-          <a href="/login" class="muted">Balik</a>
+          <button class="btn-primary" onclick="reqReset()">Kirim reset token</button>
         </div>
         <pre id="out" class="muted"></pre>
       </div>
@@ -402,7 +571,6 @@ const PAGES = {
             return { ok:false, error: 'Server returned non-JSON ('+r.status+'). ' + (t ? t.slice(0,200) : '') };
           }
         }
-
         async function reqReset(){
           const email = document.getElementById('e').value.trim();
           const out = document.getElementById('out');
@@ -413,9 +581,8 @@ const PAGES = {
             body:JSON.stringify({email})
           });
           const j = await readJsonOrText(r);
-          out.textContent = j.ok ? 'Jika email terdaftar, link/token reset dikirim.' : (j.error || 'gagal');
+          out.textContent = j.ok ? 'Jika email terdaftar, token dikirim.' : (j.error || 'gagal');
         }
-
         async function confirmReset(){
           const token = document.getElementById('t').value.trim();
           const newPw = document.getElementById('npw').value;
@@ -438,13 +605,14 @@ const PAGES = {
     return pageTemplate(
       "Inbox",
       `
-      <div class="top">
-        <div><b>Mail Portal</b> <span class="pill">Inbox</span></div>
-        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-          <a href="/admin" id="adminLink" style="display:none">Admin</a>
+      ${headerHtml({
+        badge: "Inbox",
+        subtitle: "Kelola alias & baca email masuk",
+        rightHtml: `
+          <a href="/admin" id="adminLink" class="pill" style="display:none">Admin</a>
           <button class="danger" onclick="logout()">Logout</button>
-        </div>
-      </div>
+        `,
+      })}
 
       <div class="card">
         <div class="row">
@@ -453,29 +621,33 @@ const PAGES = {
             <div id="me">...</div>
           </div>
           <div>
-            <div class="muted">Buat alias baru (@${domain})</div>
-            <div class="row" style="grid-template-columns:1fr auto;gap:10px">
+            <div class="muted">Buat alias baru (<b>@${domain}</b>)</div>
+            <div class="row" style="grid-template-columns:1fr auto;gap:10px;margin-top:8px">
               <input id="alias" placeholder="contoh: sipar" />
               <button class="btn-primary" onclick="createAlias()">Create</button>
             </div>
-            <div id="aliasMsg" class="muted"></div>
+            <div id="aliasMsg" class="muted" style="margin-top:8px"></div>
           </div>
         </div>
       </div>
 
       <div class="card">
-        <div class="row">
+        <div class="split">
           <div>
-            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
               <b>Aliases</b>
               <span class="muted" id="limitInfo"></span>
             </div>
-            <div id="aliases"></div>
+            <div id="aliases" style="margin-top:6px"></div>
           </div>
+
           <div>
-            <b>Emails</b>
-            <div class="muted" id="selAlias">Pilih alias…</div>
-            <div id="emails"></div>
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+              <b>Emails</b>
+              <button class="btn-ghost" onclick="loadEmails()" id="refreshBtn" disabled>Refresh</button>
+            </div>
+            <div class="muted" id="selAlias" style="margin-top:6px">Pilih alias…</div>
+            <div id="emails" style="margin-top:6px"></div>
           </div>
         </div>
       </div>
@@ -503,10 +675,10 @@ const PAGES = {
           if(!j.ok){ location.href='/login'; return; }
           ME=j.user;
           document.getElementById('me').innerHTML =
-            '<div><b>'+esc(ME.username)+'</b> ('+esc(ME.email)+')</div>'+
+            '<div><b>'+esc(ME.username)+'</b> <span class="muted">('+esc(ME.email)+')</span></div>'+
             '<div class="muted">role: '+esc(ME.role)+'</div>';
           document.getElementById('limitInfo').textContent = 'limit: '+ME.alias_limit;
-          if(ME.role==='admin') document.getElementById('adminLink').style.display='inline';
+          if(ME.role==='admin') document.getElementById('adminLink').style.display='inline-flex';
         }
 
         async function loadAliases(){
@@ -520,19 +692,15 @@ const PAGES = {
           }
           for(const a of j.aliases){
             const div=document.createElement('div');
-            div.style.display='flex';
-            div.style.justifyContent='space-between';
-            div.style.alignItems='center';
-            div.style.padding='10px 0';
-            div.style.borderBottom='1px solid var(--border)';
+            div.className='listItem';
             const addr = a.local_part+'@${domain}';
             div.innerHTML =
               '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'+
-              '<button onclick="selectAlias(\\''+esc(a.local_part)+'\\')">Open</button>'+
-              '<span>'+esc(addr)+'</span>'+
-              (a.disabled?'<span class="pill">disabled</span>':'')+
+                '<button class="btn-primary" onclick="selectAlias(\\''+a.local_part+'\\')">Open</button>'+
+                '<span>'+esc(addr)+'</span>'+
+                (a.disabled?'<span class="pill">disabled</span>':'')+
               '</div>'+
-              '<div><button onclick="delAlias(\\''+esc(a.local_part)+'\\')" class="danger">Delete</button></div>';
+              '<div><button onclick="delAlias(\\''+a.local_part+'\\')" class="danger">Delete</button></div>';
             box.appendChild(div);
           }
         }
@@ -540,6 +708,7 @@ const PAGES = {
         async function selectAlias(local){
           SELECTED=local;
           document.getElementById('selAlias').textContent = 'Alias: '+local+'@${domain}';
+          document.getElementById('refreshBtn').disabled=false;
           await loadEmails();
         }
 
@@ -556,14 +725,14 @@ const PAGES = {
           for(const m of j.emails){
             const d=document.createElement('div');
             d.style.padding='10px 0';
-            d.style.borderBottom='1px solid var(--border)';
+            d.style.borderBottom='1px solid rgba(34,49,74,.95)';
             d.innerHTML =
               '<div><b>'+esc(m.subject||'(no subject)')+'</b></div>'+
               '<div class="muted">From: '+esc(m.from_addr)+'</div>'+
               '<div class="muted">'+esc(m.date||'')+'</div>'+
-              '<div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">'+
-              '<button class="btn-primary" onclick="openEmail(\\''+esc(m.id)+'\\')">View</button>'+
-              '<button onclick="delEmail(\\''+esc(m.id)+'\\')" class="danger">Delete</button>'+
+              '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">'+
+                '<button class="btn-primary" onclick="openEmail(\\''+m.id+'\\')">View</button>'+
+                '<button onclick="delEmail(\\''+m.id+'\\')" class="danger">Delete</button>'+
               '</div>';
             box.appendChild(d);
           }
@@ -576,8 +745,11 @@ const PAGES = {
           const v=document.getElementById('emailView');
           v.style.display='block';
           v.innerHTML =
-            '<b>'+esc(j.email.subject||'(no subject)')+'</b>'+
-            '<div class="muted">From: '+esc(j.email.from_addr)+'</div>'+
+            '<div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">'+
+              '<b>'+esc(j.email.subject||'(no subject)')+'</b>'+
+              '<button class="btn-ghost" onclick="document.getElementById(\\'emailView\\').style.display=\\'none\\'">Close</button>'+
+            '</div>'+
+            '<div class="muted" style="margin-top:6px">From: '+esc(j.email.from_addr)+'</div>'+
             '<div class="muted">To: '+esc(j.email.to_addr)+'</div>'+
             '<div class="muted">'+esc(j.email.date||'')+'</div>'+
             '<hr class="hr" />'+
@@ -592,7 +764,7 @@ const PAGES = {
             iframe.setAttribute('referrerpolicy','no-referrer');
             iframe.style.width = '100%';
             iframe.style.height = '65vh';
-            iframe.style.border = '1px solid var(--border)';
+            iframe.style.border = '1px solid rgba(34,49,74,.95)';
             iframe.style.borderRadius = '12px';
             iframe.style.background = 'var(--card2)';
             iframe.srcdoc = j.email.html;
@@ -638,7 +810,9 @@ const PAGES = {
             SELECTED=null;
             document.getElementById('selAlias').textContent='Pilih alias…';
             document.getElementById('emails').innerHTML='';
+            document.getElementById('refreshBtn').disabled=true;
           }
+          document.getElementById('emailView').style.display='none';
           await loadMe();
           await loadAliases();
         }
@@ -673,18 +847,19 @@ const PAGES = {
     return pageTemplate(
       "Admin",
       `
-      <div class="top">
-        <div><b>Admin</b> <span class="pill">Dashboard</span></div>
-        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-          <a href="/app">Inbox</a>
+      ${headerHtml({
+        badge: "Admin",
+        subtitle: "Kelola user & limit alias • @" + domain,
+        rightHtml: `
+          <a href="/app" class="pill">Inbox</a>
           <button class="danger" onclick="logout()">Logout</button>
-        </div>
-      </div>
+        `,
+      })}
 
       <div class="card">
         <b>Users</b>
-        <div class="muted">Domain: @${domain}</div>
-        <div id="users"></div>
+        <div class="muted" style="margin-top:6px">Domain: <span class="kbd">@${domain}</span></div>
+        <div id="users" style="margin-top:10px"></div>
       </div>
 
       <script>
@@ -711,22 +886,21 @@ const PAGES = {
           box.innerHTML='';
           for(const u of j.users){
             const div=document.createElement('div');
-            div.style.padding='10px 0';
-            div.style.borderBottom='1px solid var(--border)';
+            div.className='listItem';
             div.innerHTML =
-              '<div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">'+
-              '<div>'+
-              '<b>'+esc(u.username)+'</b> <span class="muted">('+esc(u.email)+')</span> '+
-              (u.role==='admin' ? '<span class="pill">admin</span>' : '')+
-              (u.disabled?'<span class="pill">disabled</span>':'')+
+              '<div style="min-width:260px">'+
+                '<div><b>'+esc(u.username)+'</b> <span class="muted">('+esc(u.email)+')</span></div>'+
+                '<div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'+
+                  (u.role==='admin' ? '<span class="pill">admin</span>' : '<span class="pill">user</span>')+
+                  (u.disabled?'<span class="pill">disabled</span>':'')+
+                  '<span class="pill">created: '+esc(u.created_at)+'</span>'+
+                '</div>'+
               '</div>'+
-              '<div style="display:flex;gap:8px;align-items:center;min-width:320px;flex-wrap:wrap">'+
-              '<input id="lim_'+esc(u.id)+'" value="'+u.alias_limit+'" style="width:140px" />'+
-              '<button class="btn-primary" onclick="setLimit(\\''+esc(u.id)+'\\')">Set limit</button>'+
-              '<button onclick="toggleUser(\\''+esc(u.id)+'\\','+(u.disabled?0:1)+')" class="danger">'+(u.disabled?'Enable':'Disable')+'</button>'+
-              '</div>'+
-              '</div>'+
-              '<div class="muted">created: '+esc(u.created_at)+'</div>';
+              '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+
+                '<input id="lim_'+esc(u.id)+'" value="'+u.alias_limit+'" style="width:120px" />'+
+                '<button class="btn-primary" onclick="setLimit(\\''+esc(u.id)+'\\')">Set limit</button>'+
+                '<button onclick="toggleUser(\\''+esc(u.id)+'\\','+(u.disabled?0:1)+')" class="danger">'+(u.disabled?'Enable':'Disable')+'</button>'+
+              '</div>';
             box.appendChild(div);
           }
         }
@@ -815,8 +989,16 @@ async function destroySession(request, env) {
 
 async function cleanupExpired(env) {
   const t = nowSec();
-  await env.DB.prepare(`DELETE FROM sessions WHERE expires_at <= ?`).bind(t).run();
-  await env.DB.prepare(`DELETE FROM reset_tokens WHERE expires_at <= ?`).bind(t).run();
+  try {
+    await env.DB.prepare(`DELETE FROM sessions WHERE expires_at <= ?`).bind(t).run();
+  } catch (e) {
+    console.log("cleanup sessions error:", e?.message || String(e));
+  }
+  try {
+    await env.DB.prepare(`DELETE FROM reset_tokens WHERE expires_at <= ?`).bind(t).run();
+  } catch (e) {
+    console.log("cleanup reset_tokens error:", e?.message || String(e));
+  }
 }
 
 // -------------------- Reset email (optional Resend) --------------------
@@ -828,7 +1010,7 @@ async function sendResetEmail(env, toEmail, token) {
 
   const subject = "Reset password";
   const bodyHtml = `
-    <div>
+    <div style="font-family:Arial,sans-serif">
       <p>Permintaan reset password.</p>
       <p><b>Token:</b> ${token}</p>
       ${link ? `<p>Atau klik: <a href="${link}">${link}</a></p>` : ""}
@@ -865,6 +1047,7 @@ export default {
 
     const url = new URL(request.url);
     const path = url.pathname;
+    const cookieSecure = url.protocol === "https:"; // dev-friendly
 
     // Pages
     if (request.method === "GET") {
@@ -893,9 +1076,11 @@ export default {
             return badRequest("Email tidak valid");
           if (pw.length < 8) return badRequest("Password minimal 8 karakter");
 
+          const iters = pbkdf2Iters(env);
+
           const salt = crypto.getRandomValues(new Uint8Array(16));
           const pass_salt = base64Url(salt);
-          const pass_hash = await pbkdf2HashBase64Url(pw, salt, pbkdf2Iters(env));
+          const pass_hash = await pbkdf2HashBase64Url(pw, salt, iters);
 
           const t = nowSec();
           const id = crypto.randomUUID();
@@ -907,12 +1092,22 @@ export default {
           const aliasLimit = safeInt(env.DEFAULT_ALIAS_LIMIT, 3);
 
           try {
-            await env.DB.prepare(
-              `INSERT INTO users (id, username, email, pass_salt, pass_hash, role, alias_limit, disabled, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`
-            )
-              .bind(id, username, email, pass_salt, pass_hash, role, aliasLimit, t)
-              .run();
+            const hasIters = await usersHasPassIters(env);
+            if (hasIters) {
+              await env.DB.prepare(
+                `INSERT INTO users (id, username, email, pass_salt, pass_hash, pass_iters, role, alias_limit, disabled, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
+              )
+                .bind(id, username, email, pass_salt, pass_hash, iters, role, aliasLimit, t)
+                .run();
+            } else {
+              await env.DB.prepare(
+                `INSERT INTO users (id, username, email, pass_salt, pass_hash, role, alias_limit, disabled, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`
+              )
+                .bind(id, username, email, pass_salt, pass_hash, role, aliasLimit, t)
+                .run();
+            }
           } catch (e) {
             const msg = String(e && e.message ? e.message : e);
             if (msg.toUpperCase().includes("UNIQUE"))
@@ -927,7 +1122,7 @@ export default {
           return json(
             { ok: true },
             200,
-            { "set-cookie": setCookieHeader("session", token, { maxAge: ttl }) }
+            { "set-cookie": setCookieHeader("session", token, { maxAge: ttl, secure: cookieSecure }) }
           );
         }
 
@@ -940,17 +1135,41 @@ export default {
 
           if (!id || !pw) return badRequest("Lengkapi data");
 
-          const user = await env.DB.prepare(
-            `SELECT id, username, email, pass_salt, pass_hash, role, alias_limit, disabled
-             FROM users WHERE username = ? OR email = ?`
-          )
-            .bind(id, id)
-            .first();
+          const hasIters = await usersHasPassIters(env);
+
+          const user = hasIters
+            ? await env.DB.prepare(
+                `SELECT id, username, email, pass_salt, pass_hash, pass_iters, role, alias_limit, disabled
+                 FROM users WHERE username = ? OR email = ?`
+              ).bind(id, id).first()
+            : await env.DB.prepare(
+                `SELECT id, username, email, pass_salt, pass_hash, role, alias_limit, disabled
+                 FROM users WHERE username = ? OR email = ?`
+              ).bind(id, id).first();
 
           if (!user || user.disabled) return unauthorized("Login gagal");
 
           const saltBytes = base64UrlToBytes(user.pass_salt);
-          const hash = await pbkdf2HashBase64Url(pw, saltBytes, pbkdf2Iters(env));
+
+          // If per-user iters exists, use it. Else rely on env (must be consistent).
+          const iters = hasIters ? safeInt(user.pass_iters, pbkdf2Iters(env)) : pbkdf2Iters(env);
+
+          if (iters > PBKDF2_MAX_ITERS) {
+            // This user cannot be verified on Workers WebCrypto.
+            return unauthorized("Hash password lama tidak didukung. Silakan reset password.");
+          }
+
+          let hash;
+          try {
+            hash = await pbkdf2HashBase64Url(pw, saltBytes, iters);
+          } catch (e) {
+            const name = e?.name || "";
+            if (name === "NotSupportedError") {
+              return unauthorized("Parameter hash tidak didukung. Silakan reset password.");
+            }
+            throw e;
+          }
+
           if (hash !== user.pass_hash) return unauthorized("Login gagal");
 
           const ttl = safeInt(env.SESSION_TTL_SECONDS, 1209600);
@@ -959,7 +1178,7 @@ export default {
           return json(
             { ok: true },
             200,
-            { "set-cookie": setCookieHeader("session", token, { maxAge: ttl }) }
+            { "set-cookie": setCookieHeader("session", token, { maxAge: ttl, secure: cookieSecure }) }
           );
         }
 
@@ -968,7 +1187,7 @@ export default {
           return json(
             { ok: true },
             200,
-            { "set-cookie": setCookieHeader("session", "", { maxAge: 0 }) }
+            { "set-cookie": setCookieHeader("session", "", { maxAge: 0, secure: cookieSecure }) }
           );
         }
 
@@ -1024,13 +1243,22 @@ export default {
 
           if (!rt || rt.expires_at <= nowSec()) return badRequest("Token invalid/expired");
 
+          const iters = pbkdf2Iters(env);
           const salt = crypto.getRandomValues(new Uint8Array(16));
           const pass_salt = base64Url(salt);
-          const pass_hash = await pbkdf2HashBase64Url(newPw, salt, pbkdf2Iters(env));
+          const pass_hash = await pbkdf2HashBase64Url(newPw, salt, iters);
 
-          await env.DB.prepare(`UPDATE users SET pass_salt=?, pass_hash=? WHERE id=?`)
-            .bind(pass_salt, pass_hash, rt.user_id)
-            .run();
+          const hasIters = await usersHasPassIters(env);
+          if (hasIters) {
+            await env.DB.prepare(`UPDATE users SET pass_salt=?, pass_hash=?, pass_iters=? WHERE id=?`)
+              .bind(pass_salt, pass_hash, iters, rt.user_id)
+              .run();
+          } else {
+            await env.DB.prepare(`UPDATE users SET pass_salt=?, pass_hash=? WHERE id=?`)
+              .bind(pass_salt, pass_hash, rt.user_id)
+              .run();
+          }
+
           await env.DB.prepare(`DELETE FROM reset_tokens WHERE token_hash=?`)
             .bind(tokenHash)
             .run();

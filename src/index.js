@@ -1,17 +1,26 @@
 // src/index.js
-// Org_Lemah Mail Portal - Full Script with Improved Modern UI
-// Ready to deploy!
-
 import PostalMime from "postal-mime";
+
+/**
+ * Cloudflare Email Routing + Email Worker + Web Inbox
+ * Features:
+ * - Signup/Login/Logout
+ * - Reset password (optional via Resend)
+ * - Alias management with per-user limit
+ * - Admin dashboard: list users, set alias limit, disable user
+ * - Email handler: accept via catch-all, store if alias registered else reject
+ */
 
 const encoder = new TextEncoder();
 
-// Security/Hashing constants
-const PBKDF2_MAX_ITERS = 100000;
-const PBKDF2_MIN_ITERS = 10000;
+// -------------------- Security/Hashing constants --------------------
+const PBKDF2_MAX_ITERS = 100000; // Cloudflare Workers WebCrypto limit
+const PBKDF2_MIN_ITERS = 10000;  // keep a sensible floor
+
+// Cache (per isolate) whether DB has users.pass_iters column
 let USERS_HAS_PASS_ITERS = null;
 
-// Response helpers
+// -------------------- Response helpers --------------------
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
@@ -20,6 +29,7 @@ function json(data, status = 200, headers = {}) {
       "cache-control": "no-store",
       "x-content-type-options": "nosniff",
       "referrer-policy": "no-referrer",
+      "permissions-policy": "geolocation=(), microphone=(), camera=()",
       ...headers,
     },
   });
@@ -33,6 +43,7 @@ function html(body, status = 200, headers = {}) {
       "cache-control": "no-store",
       "x-content-type-options": "nosniff",
       "referrer-policy": "no-referrer",
+      "permissions-policy": "geolocation=(), microphone=(), camera=()",
       ...headers,
     },
   });
@@ -51,7 +62,7 @@ function notFound() {
   return json({ ok: false, error: "Not found" }, 404);
 }
 
-// Utils
+// -------------------- Utils --------------------
 function safeInt(v, fallback) {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
@@ -67,10 +78,13 @@ function clampPbkdf2Iters(n) {
 }
 
 function pbkdf2Iters(env) {
+  // IMPORTANT: Workers WebCrypto max 100000, jadi kita clamp.
+  // Env PBKDF2_ITERS boleh diset, tapi tetap tidak bisa > 100000.
   return clampPbkdf2Iters(env.PBKDF2_ITERS ?? PBKDF2_MAX_ITERS);
 }
 
 function base64Url(bytes) {
+  // small arrays only (we only use for salts/tokens/hashes) -> safe
   const bin = String.fromCharCode(...bytes);
   const b64 = btoa(bin);
   return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
@@ -91,6 +105,7 @@ async function sha256Base64Url(inputBytes) {
 }
 
 async function pbkdf2HashBase64Url(password, saltBytes, iterations) {
+  // Fail-fast bila someone tries to pass > max
   const it = safeInt(iterations, 0);
   if (it > PBKDF2_MAX_ITERS) {
     const err = new Error(
@@ -159,6 +174,7 @@ async function readJson(request) {
 }
 
 function validLocalPart(local) {
+  // simple + aman: huruf angka . _ + - (1..64)
   return /^[a-z0-9][a-z0-9._+-]{0,63}$/.test(local);
 }
 
@@ -174,27 +190,7 @@ async function usersHasPassIters(env) {
   return USERS_HAS_PASS_ITERS;
 }
 
-// UI: Brand + Template
-const LOGO_SVG = `
-<svg viewBox="0 0 64 64" width="34" height="34" aria-hidden="true" focusable="false">
-  <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#7dd3fc"/>
-      <stop offset="1" stop-color="#6366f1"/>
-    </linearGradient>
-    <filter id="s" x="-30%" y="-30%" width="160%" height="160%">
-      <feDropShadow dx="0" dy="6" stdDeviation="6" flood-color="#000" flood-opacity="0.35"/>
-    </filter>
-  </defs>
-  <circle cx="32" cy="32" r="26" fill="url(#g)" filter="url(#s)"/>
-  <circle cx="32" cy="32" r="24" fill="rgba(11,15,20,0.35)"/>
-  <path d="M22 40V24h6c6 0 10 3 10 8s-4 8-10 8h-6zm6-4h1c3.6 0 5.8-1.8 5.8-4s-2.2-4-5.8-4h-1v8z"
-        fill="#e6edf3" opacity="0.95"/>
-  <path d="M42 24h4v12c0 2.6-1.5 4.2-4.3 4.2-1 0-2.2-.2-3-.6l.7-3.4c.5.2 1.1.3 1.6.3 1 0 1-.5 1-1.1V24z"
-        fill="#e6edf3" opacity="0.95"/>
-</svg>
-`;
-
+// -------------------- UI: Brand + Template --------------------
 const FAVICON_DATA = encodeURIComponent(`
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <defs>
@@ -203,27 +199,13 @@ const FAVICON_DATA = encodeURIComponent(`
       <stop offset="1" stop-color="#6366f1"/>
     </linearGradient>
   </defs>
-  <circle cx="32" cy="32" r="28" fill="url(#g)"/>
+  <rect x="6" y="6" width="52" height="52" rx="12" fill="url(#g)"/>
   <text x="32" y="40" text-anchor="middle" font-size="26" font-family="Arial" fill="#0b0f14">OL</text>
 </svg>
 `);
 
-function headerHtml({ badge, subtitle, rightHtml = "" }) {
-  return `
-  <header class="hdr">
-    <div class="brand">
-      <div class="logo">${LOGO_SVG}</div>
-      <div class="brandText">
-        <div class="brandName">Org_Lemah</div>
-        <div class="brandSub">${subtitle || ""}</div>
-      </div>
-      ${badge ? `<span class="pill">${badge}</span>` : ""}
-    </div>
-    <div class="hdrRight">${rightHtml}</div>
-  </header>`;
-}
-
 function pageTemplate(title, body, extraHead = "") {
+  // Note: keep CSP permissive for inline script/style (single-file UI).
   return `<!doctype html>
 <html lang="id">
 <head>
@@ -247,455 +229,279 @@ function pageTemplate(title, body, extraHead = "") {
   ${extraHead}
   <style>
     :root{
-      --bg:#0b0f14;
+      --bg:#070a10;
       --card:#0f172a;
       --card2:#0b1220;
-      --card-hover:#15213b;
-      --border:#22314a;
-      --border-light:#2d3f5f;
+      --border:rgba(34,49,74,.92);
       --text:#e6edf3;
-      --text-bright:#f0f6fc;
       --muted:#93a4b8;
-      --muted-dark:#6b7a8f;
-      --brand:#7dd3fc;
-      --brand-glow:rgba(125,211,252,0.3);
-      --accent:#818cf8;
+      --brand1:#7dd3fc;
+      --brand2:#6366f1;
       --danger:#ef4444;
-      --ok:#22c55e;
-      --warning:#f59e0b;
+      --shadow: 0 18px 45px rgba(0,0,0,.38);
+      --radius: 18px;
     }
-
-    *{box-sizing:border-box;margin:0;padding:0}
-
+    *{box-sizing:border-box}
+    html,body{height:100%}
     body{
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
       margin:0;
-      background:
-        radial-gradient(1400px 700px at 15% -5%, rgba(125,211,252,.15), transparent 60%),
-        radial-gradient(1000px 600px at 88% 3%, rgba(129,140,248,.13), transparent 55%),
-        radial-gradient(800px 500px at 25% 105%, rgba(34,197,94,.08), transparent 55%),
-        var(--bg);
-      background-attachment: fixed;
       color:var(--text);
-      min-height:100vh;
-      line-height:1.6;
+      background:
+        radial-gradient(1200px 680px at 15% -10%, rgba(125,211,252,.16), transparent 60%),
+        radial-gradient(900px 560px at 92% 0%, rgba(99,102,241,.14), transparent 55%),
+        radial-gradient(800px 560px at 35% 120%, rgba(125,211,252,.08), transparent 55%),
+        var(--bg);
     }
+    a{color:var(--brand1);text-decoration:none}
+    a:hover{text-decoration:underline; opacity:.92}
 
-    b, strong { font-weight:600; color:var(--text-bright) }
-    a{color:var(--brand);text-decoration:none;transition:opacity .2s}
-    a:hover{opacity:.85;text-decoration:underline}
-
-    .wrap{max-width:1180px;margin:0 auto;padding:20px}
-
-    .hdr{
+    /* Containers */
+    .wrap{max-width:980px;margin:0 auto;padding:18px}
+    .authWrap{
+      min-height:100%;
       display:flex;
-      justify-content:space-between;
       align-items:center;
-      gap:16px;
-      padding:16px 0;
-      margin-bottom:8px;
+      justify-content:center;
+      padding:16px;
     }
-    .brand{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-    .logo{display:flex;align-items:center}
-    .brandText{display:flex;flex-direction:column;line-height:1.1}
-    .brandName{
-      font-weight:800;
-      font-size:18px;
-      letter-spacing:0.3px;
-      background:linear-gradient(135deg, var(--brand), var(--accent));
-      -webkit-background-clip:text;
-      -webkit-text-fill-color:transparent;
-      background-clip:text;
-    }
-    .brandSub{color:var(--muted);font-size:13px;margin-top:4px}
-    .hdrRight{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-
-    .card{
-      background: linear-gradient(145deg, rgba(255,255,255,.045) 0%, rgba(255,255,255,.01) 100%), var(--card);
+    .authShell{
+      width:100%;
+      max-width:560px;
+      border-radius:22px;
       border:1px solid var(--border);
-      border-radius:20px;
-      padding:20px;
-      margin:14px 0;
-      box-shadow: 
-        0 10px 40px rgba(0,0,0,.4),
-        0 2px 8px rgba(0,0,0,.3),
-        inset 0 1px 0 rgba(255,255,255,.05);
+      background: linear-gradient(180deg, rgba(255,255,255,.04), transparent 45%), rgba(15,23,42,.92);
+      box-shadow: var(--shadow);
       overflow:hidden;
-      transition: border-color .3s, box-shadow .3s;
-    }
-    .card:hover{
-      border-color:var(--border-light);
-      box-shadow: 
-        0 12px 50px rgba(0,0,0,.45),
-        0 4px 12px rgba(0,0,0,.35),
-        inset 0 1px 0 rgba(255,255,255,.08);
     }
 
-    label{
-      display:block;
-      margin-bottom:7px;
-      color:var(--muted);
-      font-size:13px;
-      font-weight:500;
-      letter-spacing:0.2px;
+    /* Brand block (sesuai layout ASCII kamu) */
+    .authTop{
+      padding:18px 18px 14px;
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+      align-items:center;
+      text-align:center;
     }
+    .logoBox{
+      width:78px;height:62px;
+      border-radius:16px;
+      border:1px solid var(--border);
+      background: rgba(255,255,255,.03);
+      display:flex;align-items:center;justify-content:center;
+      position:relative;
+    }
+    .logoBox::before{
+      content:"";
+      position:absolute; inset:10px;
+      border-radius:12px;
+      background: linear-gradient(135deg, rgba(125,211,252,.26), rgba(99,102,241,.18));
+      border:1px solid rgba(125,211,252,.18);
+    }
+    .logoText{
+      position:relative;
+      font-weight:900;
+      letter-spacing:.6px;
+      font-size:22px;
+      color: var(--text);
+      text-shadow: 0 8px 22px rgba(0,0,0,.45);
+    }
+    .orgName{font-weight:900; font-size:20px; letter-spacing:.2px}
+    .portalName{color:var(--muted); font-size:13.5px; margin-top:-4px}
+    .pill{
+      display:inline-flex;align-items:center;gap:6px;
+      padding:6px 10px;border-radius:999px;
+      border:1px solid var(--border);
+      background: rgba(255,255,255,.03);
+      color:var(--muted);
+      font-size:12px;
+    }
+
+    .hr{border:0;border-top:1px solid var(--border);margin:0}
+
+    /* Auth card area */
+    .authCard{
+      padding:16px 18px 18px;
+    }
+    .authTitleRow{
+      display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;
+      margin-bottom:10px;
+    }
+    .authTitle{font-weight:800}
+    .authSub{color:var(--muted); font-size:13px; margin-top:4px}
+
+    /* Shared UI */
+    .card{
+      background: linear-gradient(180deg, rgba(255,255,255,.035), transparent 40%), rgba(15,23,42,.92);
+      border:1px solid var(--border);
+      border-radius:var(--radius);
+      padding:16px;
+      margin:12px 0;
+      box-shadow: 0 10px 30px rgba(0,0,0,.24);
+      overflow:hidden;
+    }
+
+    label{display:block;margin-bottom:6px;color:var(--muted);font-size:13px}
     input,select,textarea{
       width:100%;
-      padding:12px 14px;
+      padding:12px 12px;
       border-radius:14px;
-      border:1.5px solid var(--border);
-      background: var(--card2);
+      border:1px solid var(--border);
+      background: rgba(11,18,32,.92);
       color:var(--text);
       outline:none;
       font-size:15px;
-      transition: all .25s ease;
     }
+    input::placeholder{color: rgba(147,164,184,.65)}
     input:focus,select:focus,textarea:focus{
-      border-color: var(--brand);
-      box-shadow: 0 0 0 4px var(--brand-glow);
-      background: rgba(15,23,42,0.8);
+      border-color: rgba(125,211,252,.75);
+      box-shadow: 0 0 0 4px rgba(125,211,252,.12);
     }
-    input::placeholder{color:var(--muted-dark)}
-
     button{
-      padding:11px 16px;
+      padding:11px 13px;
       border-radius:14px;
-      border:1.5px solid var(--border);
-      background: rgba(125,211,252,.1);
+      border:1px solid var(--border);
+      background: rgba(125,211,252,.12);
       color:var(--text);
       cursor:pointer;
-      font-size:14px;
-      font-weight:500;
-      transition: all .2s ease;
+      transition: transform .06s ease, background .15s ease, border-color .15s ease;
       white-space:nowrap;
-      display:inline-flex;
-      align-items:center;
-      gap:6px;
+      font-weight:650;
     }
-    button:hover:not(:disabled){
-      background: rgba(125,211,252,.18);
-      border-color: var(--brand);
-      transform: translateY(-1px);
-      box-shadow: 0 4px 12px rgba(125,211,252,.2);
-    }
-    button:active:not(:disabled){transform: translateY(0)}
-    button:disabled{opacity:.5;cursor:not-allowed}
-
+    button:hover{background: rgba(125,211,252,.18); border-color: rgba(125,211,252,.28)}
+    button:active{transform: translateY(1px)}
     .btn-primary{
-      background: linear-gradient(135deg, rgba(125,211,252,.25) 0%, rgba(129,140,248,.2) 100%);
-      border-color: rgba(125,211,252,.4);
-      font-weight:600;
+      background: linear-gradient(135deg, rgba(125,211,252,.32), rgba(99,102,241,.20));
+      border-color: rgba(125,211,252,.35);
     }
-    .btn-primary:hover:not(:disabled){
-      background: linear-gradient(135deg, rgba(125,211,252,.35) 0%, rgba(129,140,248,.3) 100%);
-      border-color: var(--brand);
-      box-shadow: 0 4px 16px rgba(125,211,252,.3);
-    }
-
-    .btn-ghost{
-      background: rgba(255,255,255,.04);
-      border-color: rgba(255,255,255,.08);
-    }
-    .btn-ghost:hover:not(:disabled){
-      background: rgba(255,255,255,.08);
-      border-color: rgba(255,255,255,.12);
-    }
-
+    .btn-ghost{background: rgba(255,255,255,.03)}
     .danger{
-      background: rgba(239,68,68,.12);
-      border-color: rgba(239,68,68,.4);
-      color:var(--text);
+      border-color: rgba(239,68,68,.46);
+      background: rgba(239,68,68,.10);
     }
-    .danger:hover:not(:disabled){
-      background: rgba(239,68,68,.18);
-      border-color: var(--danger);
-      box-shadow: 0 4px 12px rgba(239,68,68,.2);
-    }
-
-    .pill{
-      display:inline-flex;
-      align-items:center;
-      gap:6px;
-      padding:6px 12px;
-      border-radius:999px;
-      border:1px solid var(--border);
-      background: rgba(255,255,255,.04);
-      color:var(--muted);
-      font-size:12.5px;
-      font-weight:500;
-      white-space:nowrap;
-    }
-    .badge{
-      display:inline-block;
-      padding:4px 10px;
-      border-radius:8px;
-      font-size:11px;
-      font-weight:600;
-      letter-spacing:0.3px;
-      text-transform:uppercase;
-    }
+    .danger:hover{background: rgba(239,68,68,.15); border-color: rgba(239,68,68,.56)}
 
     .muted{color:var(--muted)}
-    .muted-dark{color:var(--muted-dark)}
-
-    .row{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}
-    .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
-
-    .split{
-      display:grid;
-      grid-template-columns: 1fr 1.5fr;
-      gap:20px;
-      align-items:start;
-    }
-
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .split{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start}
     .listItem{
-      padding:14px 16px;
+      padding:10px 0;
       border-bottom:1px solid var(--border);
-      background:transparent;
-      border-radius:12px;
-      margin-bottom:4px;
-      transition: all .2s ease;
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+      flex-wrap:wrap;
     }
-    .listItem:hover{
-      background:var(--card-hover);
-      border-color:var(--border-light);
-      transform:translateX(4px);
-    }
-    .listItem:last-child{border-bottom:0}
+    pre{margin:10px 0 0;white-space:pre-wrap;word-break:break-word; font-size:13px; line-height:1.35}
 
-    .emailItem{
-      padding:16px;
-      border:1.5px solid var(--border);
-      background:linear-gradient(145deg, rgba(255,255,255,.03), transparent);
-      border-radius:16px;
-      margin-bottom:10px;
-      cursor:pointer;
-      transition: all .25s ease;
+    .kbd{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+      padding:2px 8px;
+      border-radius:999px;
+      border:1px solid var(--border);
+      background: rgba(255,255,255,.03);
+      color: var(--muted);
+    }
+
+    /* App header */
+    .hdr{
+      display:flex;justify-content:space-between;align-items:center;
+      gap:14px; padding:10px 0 4px;
+    }
+    .brandInline{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+    .brandMiniLogo{
+      width:42px;height:36px;border-radius:12px;border:1px solid var(--border);
+      display:flex;align-items:center;justify-content:center;
+      background: rgba(255,255,255,.03);
       position:relative;
       overflow:hidden;
     }
-    .emailItem::before{
-      content:'';
-      position:absolute;
-      left:0;
-      top:0;
-      bottom:0;
-      width:4px;
-      background:linear-gradient(180deg, var(--brand), var(--accent));
-      opacity:0;
-      transition:opacity .25s;
+    .brandMiniLogo::before{
+      content:""; position:absolute; inset:7px;
+      border-radius:10px;
+      background: linear-gradient(135deg, rgba(125,211,252,.22), rgba(99,102,241,.16));
+      border:1px solid rgba(125,211,252,.14);
     }
-    .emailItem:hover{
-      border-color:var(--brand);
-      background:linear-gradient(145deg, rgba(125,211,252,.08), rgba(129,140,248,.05));
-      transform:translateY(-2px);
-      box-shadow: 0 8px 24px rgba(0,0,0,.3), 0 0 0 1px rgba(125,211,252,.1);
-    }
-    .emailItem:hover::before{opacity:1}
+    .brandMiniLogo span{position:relative;font-weight:900;font-size:14px;letter-spacing:.4px}
+    .brandText{display:flex;flex-direction:column;line-height:1.05}
+    .brandText .t1{font-weight:900}
+    .brandText .t2{color:var(--muted);font-size:12.5px;margin-top:3px}
+    .hdrRight{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 
-    .emailHeader{
-      display:flex;
-      justify-content:space-between;
-      align-items:flex-start;
-      gap:12px;
-      margin-bottom:8px;
-    }
-    .emailSubject{
-      font-size:15px;
-      font-weight:600;
-      color:var(--text-bright);
-      line-height:1.4;
-      flex:1;
-    }
-    .emailMeta{
-      display:flex;
-      align-items:center;
-      gap:8px;
-      font-size:13px;
-      color:var(--muted);
-      margin-bottom:10px;
-    }
-    .emailFrom{
-      font-weight:500;
-      color:var(--brand);
-    }
-    .emailDate{
-      color:var(--muted-dark);
-      font-size:12px;
-    }
-    .emailActions{
-      display:flex;
-      gap:8px;
-      margin-top:12px;
-      flex-wrap:wrap;
-    }
-
-    .aliasItem{
-      display:flex;
-      justify-content:space-between;
-      align-items:center;
-      gap:12px;
-      padding:12px 14px;
-      border:1.5px solid var(--border);
-      background:rgba(255,255,255,.02);
-      border-radius:14px;
-      margin-bottom:8px;
-      transition:all .2s ease;
-    }
-    .aliasItem:hover{
-      border-color:var(--brand);
-      background:rgba(125,211,252,.06);
-      transform:translateX(3px);
-    }
-    .aliasAddr{
-      font-family: ui-monospace, 'SF Mono', Monaco, 'Cascadia Code', monospace;
-      font-size:14px;
-      color:var(--text-bright);
-      font-weight:500;
-    }
-
-    .emailViewer{
-      border-top:2px solid var(--border);
-      padding-top:20px;
-      margin-top:20px;
-    }
-    .emailViewerHeader{
-      margin-bottom:20px;
-      padding-bottom:16px;
-      border-bottom:1px solid var(--border);
-    }
-    .emailViewerSubject{
-      font-size:22px;
-      font-weight:700;
-      color:var(--text-bright);
-      margin-bottom:12px;
-      line-height:1.3;
-    }
-    .emailViewerMeta{
-      display:flex;
-      flex-direction:column;
-      gap:6px;
-      font-size:14px;
-    }
-    .emailViewerMeta > div{
-      display:flex;
-      gap:8px;
-      align-items:center;
-    }
-    .emailViewerMeta label{
-      display:inline;
-      min-width:60px;
-      color:var(--muted-dark);
-      margin:0;
-    }
-    .emailViewerMeta span{color:var(--text)}
-    .emailViewerBody{
-      background:var(--card2);
-      border:1px solid var(--border);
-      border-radius:14px;
-      padding:20px;
-      margin-top:16px;
-      line-height:1.7;
-      font-size:15px;
-    }
-    .emailViewerBody iframe{
-      width:100%;
-      height:70vh;
-      border:0;
-      border-radius:12px;
-      background:white;
-    }
-
-    .kbd{
-      font-family: ui-monospace, 'SF Mono', Monaco, monospace;
-      font-size: 12.5px;
-      padding:3px 9px;
-      border-radius:8px;
-      border:1px solid var(--border);
-      background: rgba(255,255,255,.04);
-      color: var(--muted);
-      font-weight:500;
-    }
-
-    .hr{
-      border:0;
-      border-top:1px solid var(--border);
-      margin:16px 0;
-      opacity:0.8;
-    }
-
-    .emptyState{
-      text-align:center;
-      padding:40px 20px;
-      color:var(--muted);
-    }
-    .emptyState svg{
-      width:64px;
-      height:64px;
-      opacity:0.4;
-      margin-bottom:16px;
-    }
-
-    @keyframes spin{
-      to{transform:rotate(360deg)}
-    }
-    .spinner{
-      display:inline-block;
-      width:14px;
-      height:14px;
-      border:2px solid rgba(255,255,255,.2);
-      border-top-color:var(--brand);
-      border-radius:50%;
-      animation:spin .6s linear infinite;
-    }
-
-    @keyframes fadeIn{
-      from{opacity:0;transform:translateY(10px)}
-      to{opacity:1;transform:translateY(0)}
-    }
-    .card{animation:fadeIn .4s ease-out}
-
-    pre{white-space:pre-wrap;word-break:break-word}
-
-    @media (max-width: 900px){
-      .wrap{padding:16px}
+    @media (max-width: 760px){
+      .wrap{padding:14px}
       .hdr{flex-direction:column;align-items:flex-start}
-      .split{grid-template-columns:1fr}
-      .row,.row3{grid-template-columns:1fr}
-      .card{padding:16px}
+      .row,.split{grid-template-columns:1fr}
     }
-
-    @media (max-width: 640px){
-      .wrap{padding:12px}
-      .card{padding:14px;border-radius:16px}
-      .emailItem{padding:12px}
-      .emailSubject{font-size:14px}
-      .brandName{font-size:16px}
+    @media (prefers-reduced-motion: reduce){
+      button{transition:none}
+      button:active{transform:none}
     }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    ${body}
-  </div>
+  ${body}
 </body>
 </html>`;
 }
 
-// Pages
+function appHeaderHtml({ badge, subtitle, rightHtml = "" }) {
+  return `
+  <header class="hdr">
+    <div class="brandInline">
+      <div class="brandMiniLogo"><span>OL</span></div>
+      <div class="brandText">
+        <div class="t1">Org_Lemah</div>
+        <div class="t2">${subtitle || ""}</div>
+      </div>
+      ${badge ? `<span class="pill">${badge}</span>` : ""}
+    </div>
+    <div class="hdrRight">${rightHtml}</div>
+  </header>`;
+}
+
+function authShellHtml({ badge, subtitle, title, rightLinkHtml = "", innerHtml }) {
+  return `
+  <div class="authWrap">
+    <div class="authShell">
+      <div class="authTop">
+        <div class="logoBox" aria-label="Logo Org_Lemah">
+          <div class="logoText">OL</div>
+        </div>
+        <div class="orgName">Org_Lemah</div>
+        <div class="portalName">Mail Portal</div>
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:center">
+          ${badge ? `<span class="pill">${badge}</span>` : ""}
+          ${rightLinkHtml || ""}
+        </div>
+        ${subtitle ? `<div class="authSub">${subtitle}</div>` : ""}
+      </div>
+      <hr class="hr" />
+      <div class="authCard">
+        <div class="authTitleRow">
+          <div class="authTitle">${title || ""}</div>
+        </div>
+        ${innerHtml || ""}
+      </div>
+    </div>
+  </div>`;
+}
+
+// -------------------- Pages --------------------
 const PAGES = {
   login() {
     return pageTemplate(
       "Login",
-      `
-      ${headerHtml({
+      authShellHtml({
         badge: "Login",
-        subtitle: "Mail Portal • Domain alias + inbox",
-        rightHtml: `<a class="pill" href="/signup">Buat akun</a>`,
-      })}
-
-      <div class="card">
-        <div class="row">
+        subtitle: "Masuk untuk kelola alias & inbox",
+        title: "Masuk",
+        rightLinkHtml: `<a class="pill" href="/signup">Buat akun</a>`,
+        innerHtml: `
+        <div class="row" style="margin-top:10px">
           <div>
             <label>Username / Email</label>
             <input id="id" placeholder="sipar / sipar@gmail.com" autocomplete="username" />
@@ -706,52 +512,50 @@ const PAGES = {
           </div>
         </div>
 
-        <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+        <div style="margin-top:14px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
           <button class="btn-primary" onclick="login()">Login</button>
           <a href="/reset" class="muted">Lupa password?</a>
         </div>
         <pre id="out" class="muted"></pre>
-      </div>
 
-      <script>
-        async function readJsonOrText(r){
-          try { return await r.json(); }
-          catch {
-            const t = await r.text().catch(()=> '');
-            return { ok:false, error: 'Server returned non-JSON ('+r.status+'). ' + (t ? t.slice(0,200) : '') };
+        <script>
+          async function readJsonOrText(r){
+            try { return await r.json(); }
+            catch {
+              const t = await r.text().catch(()=> '');
+              return { ok:false, error: 'Server returned non-JSON ('+r.status+'). ' + (t ? t.slice(0,200) : '') };
+            }
           }
-        }
-        async function login(){
-          const id = document.getElementById('id').value.trim();
-          const pw = document.getElementById('pw').value;
-          const out = document.getElementById('out');
-          out.textContent = '...';
-          const r = await fetch('/api/auth/login',{
-            method:'POST',
-            headers:{'content-type':'application/json'},
-            body:JSON.stringify({id,pw})
-          });
-          const j = await readJsonOrText(r);
-          if(j.ok){ location.href='/app'; return; }
-          out.textContent = j.error || 'gagal';
-        }
-      </script>
-      `
+          async function login(){
+            const id = document.getElementById('id').value.trim();
+            const pw = document.getElementById('pw').value;
+            const out = document.getElementById('out');
+            out.textContent = '...';
+            const r = await fetch('/api/auth/login',{
+              method:'POST',
+              headers:{'content-type':'application/json'},
+              body:JSON.stringify({id,pw})
+            });
+            const j = await readJsonOrText(r);
+            if(j.ok){ location.href='/app'; return; }
+            out.textContent = j.error || 'gagal';
+          }
+        </script>
+        `,
+      })
     );
   },
 
   signup(domain) {
     return pageTemplate(
       "Signup",
-      `
-      ${headerHtml({
+      authShellHtml({
         badge: "Signup",
-        subtitle: "Buat akun • Alias email @" + domain,
-        rightHtml: `<a class="pill" href="/login">Login</a>`,
-      })}
-
-      <div class="card">
-        <div class="row">
+        subtitle: `Alias email kamu nanti: <span class="kbd">nama@${domain}</span>`,
+        title: "Buat akun",
+        rightLinkHtml: `<a class="pill" href="/login">Login</a>`,
+        innerHtml: `
+        <div class="row" style="margin-top:10px">
           <div>
             <label>Username</label>
             <input id="u" placeholder="sipar" autocomplete="username" />
@@ -766,116 +570,116 @@ const PAGES = {
           <label>Password</label>
           <input id="pw" type="password" placeholder="minimal 8 karakter" autocomplete="new-password" />
           <div class="muted" style="margin-top:8px">
-            Alias kamu nanti akan berbentuk <span class="kbd">nama@${domain}</span>
+            Gunakan password yang kuat agar akun aman.
           </div>
         </div>
 
-        <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
-          <button class="btn-primary" onclick="signup()">Create account</button>
+        <div style="margin-top:14px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+          <button class="btn-primary" onclick="signup()">Buat Akun</button>
         </div>
         <pre id="out" class="muted"></pre>
-      </div>
 
-      <script>
-        async function readJsonOrText(r){
-          try { return await r.json(); }
-          catch {
-            const t = await r.text().catch(()=> '');
-            return { ok:false, error: 'Server returned non-JSON ('+r.status+'). ' + (t ? t.slice(0,200) : '') };
+        <script>
+          async function readJsonOrText(r){
+            try { return await r.json(); }
+            catch {
+              const t = await r.text().catch(()=> '');
+              return { ok:false, error: 'Server returned non-JSON ('+r.status+'). ' + (t ? t.slice(0,200) : '') };
+            }
           }
-        }
-        async function signup(){
-          const username = document.getElementById('u').value.trim();
-          const email = document.getElementById('e').value.trim();
-          const pw = document.getElementById('pw').value;
-          const out = document.getElementById('out');
-          out.textContent = '...';
-          const r = await fetch('/api/auth/signup',{
-            method:'POST',
-            headers:{'content-type':'application/json'},
-            body:JSON.stringify({username,email,pw})
-          });
-          const j = await readJsonOrText(r);
-          if(j.ok){ location.href='/app'; return; }
-          out.textContent = j.error || 'gagal';
-        }
-      </script>
-      `
+          async function signup(){
+            const username = document.getElementById('u').value.trim();
+            const email = document.getElementById('e').value.trim();
+            const pw = document.getElementById('pw').value;
+            const out = document.getElementById('out');
+            out.textContent = '...';
+            const r = await fetch('/api/auth/signup',{
+              method:'POST',
+              headers:{'content-type':'application/json'},
+              body:JSON.stringify({username,email,pw})
+            });
+            const j = await readJsonOrText(r);
+            if(j.ok){ location.href='/app'; return; }
+            out.textContent = j.error || 'gagal';
+          }
+        </script>
+        `,
+      })
     );
   },
 
   reset() {
     return pageTemplate(
       "Reset Password",
-      `
-      ${headerHtml({
+      authShellHtml({
         badge: "Reset",
-        subtitle: "Kirim token reset / set password baru",
-        rightHtml: `<a class="pill" href="/login">Login</a>`,
-      })}
-
-      <div class="card">
-        <label>Email akun</label>
-        <input id="e" placeholder="sipar@gmail.com" autocomplete="email" />
-        <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
-          <button class="btn-primary" onclick="reqReset()">Kirim reset token</button>
-        </div>
-        <pre id="out" class="muted"></pre>
-      </div>
-
-      <div class="card">
-        <div class="muted">Punya token?</div>
-        <div class="row">
-          <div>
-            <label>Token</label>
-            <input id="t" placeholder="token dari email" />
+        subtitle: "Minta token reset atau set password baru",
+        title: "Reset Password",
+        rightLinkHtml: `<a class="pill" href="/login">Login</a>`,
+        innerHtml: `
+        <div class="card" style="margin:10px 0 0">
+          <label>Email akun</label>
+          <input id="e" placeholder="sipar@gmail.com" autocomplete="email" />
+          <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+            <button class="btn-primary" onclick="reqReset()">Kirim token</button>
           </div>
-          <div>
-            <label>Password baru</label>
-            <input id="npw" type="password" placeholder="••••••••" autocomplete="new-password" />
-          </div>
+          <pre id="out" class="muted"></pre>
         </div>
-        <div style="margin-top:12px">
-          <button class="btn-primary" onclick="confirmReset()">Set password</button>
-        </div>
-        <pre id="out2" class="muted"></pre>
-      </div>
 
-      <script>
-        async function readJsonOrText(r){
-          try { return await r.json(); }
-          catch {
-            const t = await r.text().catch(()=> '');
-            return { ok:false, error: 'Server returned non-JSON ('+r.status+'). ' + (t ? t.slice(0,200) : '') };
+        <div class="card">
+          <div class="muted">Punya token?</div>
+          <div class="row" style="margin-top:10px">
+            <div>
+              <label>Token</label>
+              <input id="t" placeholder="token dari email" />
+            </div>
+            <div>
+              <label>Password baru</label>
+              <input id="npw" type="password" placeholder="••••••••" autocomplete="new-password" />
+            </div>
+          </div>
+          <div style="margin-top:12px">
+            <button class="btn-primary" onclick="confirmReset()">Set password</button>
+          </div>
+          <pre id="out2" class="muted"></pre>
+        </div>
+
+        <script>
+          async function readJsonOrText(r){
+            try { return await r.json(); }
+            catch {
+              const t = await r.text().catch(()=> '');
+              return { ok:false, error: 'Server returned non-JSON ('+r.status+'). ' + (t ? t.slice(0,200) : '') };
+            }
           }
-        }
-        async function reqReset(){
-          const email = document.getElementById('e').value.trim();
-          const out = document.getElementById('out');
-          out.textContent = '...';
-          const r = await fetch('/api/auth/reset/request',{
-            method:'POST',
-            headers:{'content-type':'application/json'},
-            body:JSON.stringify({email})
-          });
-          const j = await readJsonOrText(r);
-          out.textContent = j.ok ? 'Jika email terdaftar, token dikirim.' : (j.error || 'gagal');
-        }
-        async function confirmReset(){
-          const token = document.getElementById('t').value.trim();
-          const newPw = document.getElementById('npw').value;
-          const out = document.getElementById('out2');
-          out.textContent = '...';
-          const r = await fetch('/api/auth/reset/confirm',{
-            method:'POST',
-            headers:{'content-type':'application/json'},
-            body:JSON.stringify({token,newPw})
-          });
-          const j = await readJsonOrText(r);
-          out.textContent = j.ok ? 'Password diubah. Silakan login.' : (j.error || 'gagal');
-        }
-      </script>
-      `
+          async function reqReset(){
+            const email = document.getElementById('e').value.trim();
+            const out = document.getElementById('out');
+            out.textContent = '...';
+            const r = await fetch('/api/auth/reset/request',{
+              method:'POST',
+              headers:{'content-type':'application/json'},
+              body:JSON.stringify({email})
+            });
+            const j = await readJsonOrText(r);
+            out.textContent = j.ok ? 'Jika email terdaftar, token dikirim.' : (j.error || 'gagal');
+          }
+          async function confirmReset(){
+            const token = document.getElementById('t').value.trim();
+            const newPw = document.getElementById('npw').value;
+            const out = document.getElementById('out2');
+            out.textContent = '...';
+            const r = await fetch('/api/auth/reset/confirm',{
+              method:'POST',
+              headers:{'content-type':'application/json'},
+              body:JSON.stringify({token,newPw})
+            });
+            const j = await readJsonOrText(r);
+            out.textContent = j.ok ? 'Password diubah. Silakan login.' : (j.error || 'gagal');
+          }
+        </script>
+        `,
+      })
     );
   },
 
@@ -883,92 +687,62 @@ const PAGES = {
     return pageTemplate(
       "Inbox",
       `
-      ${headerHtml({
-        badge: "Inbox",
-        subtitle: "Kelola alias & baca email masuk",
-        rightHtml: `
-          <a href="/admin" id="adminLink" class="pill" style="display:none">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
-            </svg>
-            Admin
-          </a>
-          <button class="danger" onclick="logout()">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>
-            </svg>
-            Logout
-          </button>
-        `,
-      })}
+      <div class="wrap">
+        ${appHeaderHtml({
+          badge: "Inbox",
+          subtitle: "Kelola alias & baca email masuk",
+          rightHtml: `
+            <a href="/admin" id="adminLink" class="pill" style="display:none">Admin</a>
+            <button class="danger" onclick="logout()">Logout</button>
+          `,
+        })}
 
-      <div class="card">
-        <div class="row">
-          <div>
-            <label>👤 Akun Anda</label>
-            <div id="me" style="margin-top:8px">
-              <div class="spinner"></div>
-              <span class="muted" style="margin-left:8px">Loading...</span>
+        <div class="card">
+          <div class="row">
+            <div>
+              <div class="muted">Akun</div>
+              <div id="me">...</div>
             </div>
-          </div>
-          <div>
-            <label>✉️ Buat Alias Baru (<b>@${domain}</b>)</label>
-            <div style="display:grid;grid-template-columns:1fr auto;gap:10px;margin-top:8px">
-              <input id="alias" placeholder="contoh: myname" />
-              <button class="btn-primary" onclick="createAlias()">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-                </svg>
-                Create
-              </button>
+            <div>
+              <div class="muted">Buat alias baru (<b>@${domain}</b>)</div>
+              <div class="row" style="grid-template-columns:1fr auto;gap:10px;margin-top:8px">
+                <input id="alias" placeholder="contoh: sipar" />
+                <button class="btn-primary" onclick="createAlias()">Create</button>
+              </div>
+              <div id="aliasMsg" class="muted" style="margin-top:8px"></div>
             </div>
-            <div id="aliasMsg" class="muted" style="margin-top:8px;font-size:13px"></div>
           </div>
         </div>
-      </div>
 
-      <div class="card">
-        <div class="split">
-          <div>
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-              <div>
-                <b style="font-size:16px">📬 Your Aliases</b>
-                <div class="muted" style="font-size:12px;margin-top:2px">
-                  <span id="limitInfo">limit: —</span>
-                </div>
+        <div class="card">
+          <div class="split">
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+                <b>Aliases</b>
+                <span class="muted" id="limitInfo"></span>
               </div>
+              <div id="aliases" style="margin-top:6px"></div>
             </div>
-            <div id="aliases"></div>
-          </div>
 
-          <div>
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px">
-              <div>
-                <b style="font-size:16px">📧 Inbox</b>
-                <div class="muted" id="selAlias" style="font-size:12px;margin-top:2px">
-                  Pilih alias untuk melihat email
-                </div>
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+                <b>Emails</b>
+                <button class="btn-ghost" onclick="loadEmails()" id="refreshBtn" disabled>Refresh</button>
               </div>
-              <button class="btn-ghost" onclick="loadEmails()" id="refreshBtn" disabled style="gap:4px">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
-                  <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
-                </svg>
-                Refresh
-              </button>
+              <div class="muted" id="selAlias" style="margin-top:6px">Pilih alias…</div>
+              <div id="emails" style="margin-top:6px"></div>
             </div>
-            <div id="emails"></div>
           </div>
         </div>
-      </div>
 
-      <div class="card" id="emailView" style="display:none"></div>
+        <div class="card" id="emailView" style="display:none"></div>
+      </div>
 
       <script>
         let ME=null;
         let SELECTED=null;
 
-        function esc(s){return (s||'').replace(/[&<>\"']/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+        function esc(s){return (s||'').replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));}
 
         async function api(path, opts){
           const r = await fetch(path, opts);
@@ -985,11 +759,9 @@ const PAGES = {
           if(!j.ok){ location.href='/login'; return; }
           ME=j.user;
           document.getElementById('me').innerHTML =
-            '<div style="font-size:15px"><b>'+esc(ME.username)+'</b></div>'+
-            '<div class="muted-dark" style="font-size:13px;margin-top:2px">'+esc(ME.email)+'</div>'+
-            '<div style="margin-top:8px"><span class="badge" style="background:rgba(129,140,248,.15);border:1px solid rgba(129,140,248,.3);color:var(--accent)">'+esc(ME.role)+'</span></div>';
-
-          document.getElementById('limitInfo').innerHTML = 'limit: <b>'+ME.alias_limit+'</b>';
+            '<div><b>'+esc(ME.username)+'</b> <span class="muted">('+esc(ME.email)+')</span></div>'+
+            '<div class="muted">role: '+esc(ME.role)+'</div>';
+          document.getElementById('limitInfo').textContent = 'limit: '+ME.alias_limit;
           if(ME.role==='admin') document.getElementById('adminLink').style.display='inline-flex';
         }
 
@@ -998,52 +770,29 @@ const PAGES = {
           if(!j.ok){ alert(j.error||'gagal'); return; }
           const box = document.getElementById('aliases');
           box.innerHTML='';
-
           if(j.aliases.length===0){
-            box.innerHTML=\`
-              <div class="emptyState">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
-                  <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-                </svg>
-                <div>Belum ada alias.</div>
-                <div style="font-size:12px;margin-top:4px">Buat alias pertama Anda!</div>
-              </div>
-            \`;
+            box.innerHTML='<div class="muted">Belum ada alias.</div>';
             return;
           }
-
           for(const a of j.aliases){
             const div=document.createElement('div');
-            div.className='aliasItem';
+            div.className='listItem';
             const addr = a.local_part+'@${domain}';
             div.innerHTML =
-              '<div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0">'+
-                '<button class="btn-primary" onclick="selectAlias(\''+esc(a.local_part)+'\')" style="flex-shrink:0">'+
-                  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">'+
-                    '<path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>'+
-                    '<polyline points="22,6 12,13 2,6"/>'+
-                  '</svg>'+
-                  'Open'+
-                '</button>'+
-                '<span class="aliasAddr" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis">'+esc(addr)+'</span>'+
-                (a.disabled?'<span class="badge" style="background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.3);color:var(--danger)">disabled</span>':'')+
+              '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'+
+                '<button class="btn-primary" onclick="selectAlias(\\''+a.local_part+'\\')">Open</button>'+
+                '<span>'+esc(addr)+'</span>'+
+                (a.disabled?'<span class="pill">disabled</span>':'')+
               '</div>'+
-              '<button onclick="delAlias(\''+esc(a.local_part)+'\')" class="danger" style="flex-shrink:0">'+
-                '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">'+
-                  '<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>'+
-                '</svg>'+
-                'Delete'+
-              '</button>';
+              '<div><button onclick="delAlias(\\''+a.local_part+'\\')" class="danger">Delete</button></div>';
             box.appendChild(div);
           }
         }
 
         async function selectAlias(local){
           SELECTED=local;
-          document.getElementById('selAlias').innerHTML = '<b>'+local+'@${domain}</b>';
+          document.getElementById('selAlias').textContent = 'Alias: '+local+'@${domain}';
           document.getElementById('refreshBtn').disabled=false;
-          document.getElementById('emails').innerHTML='<div class="spinner"></div><span class="muted" style="margin-left:8px">Loading emails...</span>';
           await loadEmails();
         }
 
@@ -1053,53 +802,21 @@ const PAGES = {
           if(!j.ok){ alert(j.error||'gagal'); return; }
           const box=document.getElementById('emails');
           box.innerHTML='';
-
           if(j.emails.length===0){
-            box.innerHTML=\`
-              <div class="emptyState">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
-                  <polyline points="22,6 12,13 2,6"/>
-                </svg>
-                <div>Inbox kosong</div>
-                <div style="font-size:12px;margin-top:4px">Belum ada email masuk ke alias ini</div>
-              </div>
-            \`;
+            box.innerHTML='<div class="muted">Belum ada email masuk.</div>';
             return;
           }
-
           for(const m of j.emails){
             const d=document.createElement('div');
-            d.className='emailItem';
-            d.onclick=()=>openEmail(m.id);
-
-            const subject = esc(m.subject||'(no subject)');
-            const from = esc(m.from_addr);
-            const date = esc(m.date||'');
-
+            d.style.padding='10px 0';
+            d.style.borderBottom='1px solid var(--border)';
             d.innerHTML =
-              '<div class="emailHeader">'+
-                '<div class="emailSubject">'+subject+'</div>'+
-              '</div>'+
-              '<div class="emailMeta">'+
-                '<span class="emailFrom">'+from+'</span>'+
-                '<span style="color:var(--border)">•</span>'+
-                '<span class="emailDate">'+date+'</span>'+
-              '</div>'+
-              '<div class="emailActions" onclick="event.stopPropagation()">'+
-                '<button class="btn-primary" onclick="openEmail(\''+m.id+'\')">'+
-                  '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">'+
-                    '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>'+
-                    '<circle cx="12" cy="12" r="3"/>'+
-                  '</svg>'+
-                  'View'+
-                '</button>'+
-                '<button onclick="delEmail(\''+m.id+'\')" class="danger">'+
-                  '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">'+
-                    '<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>'+
-                  '</svg>'+
-                  'Delete'+
-                '</button>'+
+              '<div><b>'+esc(m.subject||'(no subject)')+'</b></div>'+
+              '<div class="muted">From: '+esc(m.from_addr)+'</div>'+
+              '<div class="muted">'+esc(m.date||'')+'</div>'+
+              '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">'+
+                '<button class="btn-primary" onclick="openEmail(\\''+m.id+'\\')">View</button>'+
+                '<button onclick="delEmail(\\''+m.id+'\\')" class="danger">Delete</button>'+
               '</div>';
             box.appendChild(d);
           }
@@ -1111,93 +828,71 @@ const PAGES = {
 
           const v=document.getElementById('emailView');
           v.style.display='block';
-
           v.innerHTML =
-            '<div class="emailViewer">'+
-              '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">'+
-                '<h2 style="font-size:18px;color:var(--brand);margin:0">📧 Email Details</h2>'+
-                '<button class="btn-ghost" onclick="document.getElementById(\'emailView\').style.display=\'none\'">'+
-                  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">'+
-                    '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>'+
-                  '</svg>'+
-                  'Close'+
-                '</button>'+
-              '</div>'+
-              '<div class="emailViewerHeader">'+
-                '<div class="emailViewerSubject">'+esc(j.email.subject||'(no subject)')+'</div>'+
-                '<div class="emailViewerMeta">'+
-                  '<div><label>From:</label><span>'+esc(j.email.from_addr)+'</span></div>'+
-                  '<div><label>To:</label><span>'+esc(j.email.to_addr)+'</span></div>'+
-                  '<div><label>Date:</label><span>'+esc(j.email.date||'')+'</span></div>'+
-                '</div>'+
-              '</div>'+
-              '<div id="msgBody"></div>'+
-            '</div>';
+            '<div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">'+
+              '<b>'+esc(j.email.subject||'(no subject)')+'</b>'+
+              '<button class="btn-ghost" onclick="document.getElementById(\\'emailView\\').style.display=\\'none\\'">Close</button>'+
+            '</div>'+
+            '<div class="muted" style="margin-top:6px">From: '+esc(j.email.from_addr)+'</div>'+
+            '<div class="muted">To: '+esc(j.email.to_addr)+'</div>'+
+            '<div class="muted">'+esc(j.email.date||'')+'</div>'+
+            '<hr class="hr" style="margin:12px 0" />'+
+            '<div id="msgBody"></div>';
 
           const body = document.getElementById('msgBody');
 
           if (j.email.html) {
+            // Render HTML safely in sandboxed iframe (lebih aman dari XSS)
             const iframe = document.createElement('iframe');
-            iframe.setAttribute('sandbox','');
+            iframe.setAttribute('sandbox',''); // no scripts
             iframe.setAttribute('referrerpolicy','no-referrer');
-            iframe.className='emailViewerBody';
+            iframe.style.width = '100%';
+            iframe.style.height = '65vh';
+            iframe.style.border = '1px solid var(--border)';
+            iframe.style.borderRadius = '14px';
+            iframe.style.background = 'rgba(11,18,32,.92)';
             iframe.srcdoc = j.email.html;
-
-            const wrapper = document.createElement('div');
-            wrapper.appendChild(iframe);
+            body.appendChild(iframe);
 
             const note = document.createElement('div');
-            note.className = 'muted-dark';
-            note.style.cssText = 'margin-top:12px;font-size:12px;text-align:center';
-            note.innerHTML = '🔒 HTML displayed in sandboxed iframe (safe from XSS)';
-            wrapper.appendChild(note);
-
-            body.appendChild(wrapper);
+            note.className = 'muted';
+            note.style.marginTop = '8px';
+            note.textContent = 'HTML ditampilkan dalam iframe sandbox.';
+            body.appendChild(note);
           } else {
             const pre = document.createElement('pre');
-            pre.className = 'emailViewerBody';
-            pre.style.cssText = 'white-space:pre-wrap;word-break:break-word;font-family:inherit';
-            pre.textContent = j.email.text || '(empty)';
+            pre.style.whiteSpace = 'pre-wrap';
+            pre.textContent = j.email.text || '';
             body.appendChild(pre);
           }
 
-          v.scrollIntoView({behavior:'smooth',block:'start'});
+          v.scrollIntoView({behavior:'smooth'});
         }
 
         async function createAlias(){
           const local = document.getElementById('alias').value.trim().toLowerCase();
           const msg=document.getElementById('aliasMsg');
-          msg.innerHTML='<span class="spinner"></span> Creating...';
-
-          try{
-            const j = await api('/api/aliases', {
-              method:'POST',
-              headers:{'content-type':'application/json'},
-              body:JSON.stringify({local})
-            });
-
-            if(j.ok){
-              msg.innerHTML='✅ Alias created successfully!';
-              document.getElementById('alias').value='';
-              await loadMe();
-              await loadAliases();
-              setTimeout(()=>msg.innerHTML='',3000);
-            }else{
-              msg.innerHTML='❌ '+(j.error||'Failed to create alias');
-            }
-          }catch(e){
-            msg.innerHTML='❌ '+e.message;
+          msg.textContent='...';
+          const j = await api('/api/aliases', {
+            method:'POST',
+            headers:{'content-type':'application/json'},
+            body:JSON.stringify({local})
+          });
+          msg.textContent = j.ok ? 'Alias dibuat.' : (j.error||'gagal');
+          if(j.ok){
+            document.getElementById('alias').value='';
+            await loadMe();
+            await loadAliases();
           }
         }
 
         async function delAlias(local){
-          if(!confirm('Delete alias '+local+'@${domain}?')) return;
+          if(!confirm('Hapus alias '+local+'@${domain} ?')) return;
           const j = await api('/api/aliases/'+encodeURIComponent(local), {method:'DELETE'});
           if(!j.ok){ alert(j.error||'gagal'); return; }
-
           if(SELECTED===local){
             SELECTED=null;
-            document.getElementById('selAlias').textContent='Pilih alias untuk melihat email';
+            document.getElementById('selAlias').textContent='Pilih alias…';
             document.getElementById('emails').innerHTML='';
             document.getElementById('refreshBtn').disabled=true;
           }
@@ -1207,7 +902,7 @@ const PAGES = {
         }
 
         async function delEmail(id){
-          if(!confirm('Delete this email?')) return;
+          if(!confirm('Hapus email ini?')) return;
           const j = await api('/api/emails/'+encodeURIComponent(id), {method:'DELETE'});
           if(!j.ok){ alert(j.error||'gagal'); return; }
           document.getElementById('emailView').style.display='none';
@@ -1236,23 +931,25 @@ const PAGES = {
     return pageTemplate(
       "Admin",
       `
-      ${headerHtml({
-        badge: "Admin",
-        subtitle: "Kelola user & limit alias • @" + domain,
-        rightHtml: `
-          <a href="/app" class="pill">Inbox</a>
-          <button class="danger" onclick="logout()">Logout</button>
-        `,
-      })}
+      <div class="wrap">
+        ${appHeaderHtml({
+          badge: "Admin",
+          subtitle: "Kelola user & limit alias • @" + domain,
+          rightHtml: `
+            <a href="/app" class="pill">Inbox</a>
+            <button class="danger" onclick="logout()">Logout</button>
+          `,
+        })}
 
-      <div class="card">
-        <b>Users</b>
-        <div class="muted" style="margin-top:6px">Domain: <span class="kbd">@${domain}</span></div>
-        <div id="users" style="margin-top:10px"></div>
+        <div class="card">
+          <b>Users</b>
+          <div class="muted" style="margin-top:6px">Domain: <span class="kbd">@${domain}</span></div>
+          <div id="users" style="margin-top:10px"></div>
+        </div>
       </div>
 
       <script>
-        function esc(s){return (s||'').replace(/[&<>\"']/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+        function esc(s){return (s||'').replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));}
 
         async function api(path, opts){
           const r = await fetch(path, opts);
@@ -1287,8 +984,8 @@ const PAGES = {
               '</div>'+
               '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+
                 '<input id="lim_'+esc(u.id)+'" value="'+u.alias_limit+'" style="width:120px" />'+
-                '<button class="btn-primary" onclick="setLimit(\''+esc(u.id)+'\')">Set limit</button>'+
-                '<button onclick="toggleUser(\''+esc(u.id)+'\','+(u.disabled?0:1)+')" class="danger">'+(u.disabled?'Enable':'Disable')+'</button>'+
+                '<button class="btn-primary" onclick="setLimit(\\''+esc(u.id)+'\\')">Set limit</button>'+
+                '<button onclick="toggleUser(\\''+esc(u.id)+'\\','+(u.disabled?0:1)+')" class="danger">'+(u.disabled?'Enable':'Disable')+'</button>'+
               '</div>';
             box.appendChild(div);
           }
@@ -1328,7 +1025,7 @@ const PAGES = {
   },
 };
 
-// Auth/session helpers
+// -------------------- Auth/session helpers --------------------
 async function getUserBySession(request, env) {
   const token = getCookie(request, "session");
   if (!token) return null;
@@ -1390,7 +1087,7 @@ async function cleanupExpired(env) {
   }
 }
 
-// Reset email (optional Resend)
+// -------------------- Reset email (optional Resend) --------------------
 async function sendResetEmail(env, toEmail, token) {
   if (!env.RESEND_API_KEY) return;
 
@@ -1429,14 +1126,14 @@ async function sendResetEmail(env, toEmail, token) {
   }
 }
 
-// Worker entry
+// -------------------- Worker entry --------------------
 export default {
   async fetch(request, env, ctx) {
     ctx.waitUntil(cleanupExpired(env));
 
     const url = new URL(request.url);
     const path = url.pathname;
-    const cookieSecure = url.protocol === "https:";
+    const cookieSecure = url.protocol === "https:"; // dev-friendly
 
     // Pages
     if (request.method === "GET") {
@@ -1447,7 +1144,7 @@ export default {
       if (path === "/admin") return html(PAGES.admin(env.DOMAIN));
     }
 
-    // API
+    // API (dibungkus try/catch supaya gak pernah return HTML error -> "bad json")
     if (path.startsWith("/api/")) {
       try {
         // Auth
@@ -1474,6 +1171,7 @@ export default {
           const t = nowSec();
           const id = crypto.randomUUID();
 
+          // first user becomes admin
           const c = await env.DB.prepare(`SELECT COUNT(*) as c FROM users`).first();
           const count = Number(c?.c ?? 0);
           const role = count === 0 ? "admin" : "user";
@@ -1518,24 +1216,45 @@ export default {
           const body = await readJson(request);
           if (!body) return badRequest("JSON required");
 
-          const id = String(body.id || "").trim().toLowerCase();
+          const id = String(body.id || "").trim().toLowerCase(); // username or email
           const pw = String(body.pw || "");
 
           if (!id || !pw) return badRequest("Lengkapi data");
 
           const hasIters = await usersHasPassIters(env);
-          let query = `SELECT id, username, email, pass_salt, pass_hash, role, alias_limit, disabled FROM users WHERE username = ? OR email = ?`;
-          if (hasIters) {
-            query = `SELECT id, username, email, pass_salt, pass_hash, pass_iters, role, alias_limit, disabled FROM users WHERE username = ? OR email = ?`;
-          }
 
-          const user = await env.DB.prepare(query).bind(id, id).first();
+          const user = hasIters
+            ? await env.DB.prepare(
+                `SELECT id, username, email, pass_salt, pass_hash, pass_iters, role, alias_limit, disabled
+                 FROM users WHERE username = ? OR email = ?`
+              ).bind(id, id).first()
+            : await env.DB.prepare(
+                `SELECT id, username, email, pass_salt, pass_hash, role, alias_limit, disabled
+                 FROM users WHERE username = ? OR email = ?`
+              ).bind(id, id).first();
 
           if (!user || user.disabled) return unauthorized("Login gagal");
 
           const saltBytes = base64UrlToBytes(user.pass_salt);
-          const userIters = user.pass_iters ? Number(user.pass_iters) : pbkdf2Iters(env);
-          const hash = await pbkdf2HashBase64Url(pw, saltBytes, userIters);
+
+          // If per-user iters exists, use it. Else rely on env (must be consistent).
+          const iters = hasIters ? safeInt(user.pass_iters, pbkdf2Iters(env)) : pbkdf2Iters(env);
+
+          if (iters > PBKDF2_MAX_ITERS) {
+            return unauthorized("Hash password lama tidak didukung. Silakan reset password.");
+          }
+
+          let hash;
+          try {
+            hash = await pbkdf2HashBase64Url(pw, saltBytes, iters);
+          } catch (e) {
+            const name = e?.name || "";
+            if (name === "NotSupportedError") {
+              return unauthorized("Parameter hash tidak didukung. Silakan reset password.");
+            }
+            throw e;
+          }
+
           if (hash !== user.pass_hash) return unauthorized("Login gagal");
 
           const ttl = safeInt(env.SESSION_TTL_SECONDS, 1209600);
@@ -1570,6 +1289,7 @@ export default {
             .bind(email)
             .first();
 
+          // Selalu balas ok (anti user-enumeration)
           if (!user || user.disabled) return json({ ok: true });
 
           const tokenBytes = crypto.getRandomValues(new Uint8Array(32));
@@ -1667,13 +1387,14 @@ export default {
           const local = String(body.local || "").trim().toLowerCase();
           if (!validLocalPart(local)) return badRequest("Alias tidak valid (a-z0-9._+- max 64)");
 
+          // enforce limit
           const cnt = await env.DB.prepare(
             `SELECT COUNT(*) as c FROM aliases WHERE user_id = ? AND disabled = 0`
           )
             .bind(me.id)
             .first();
 
-          if ((cnt?.c || 0) >= me.alias_limit) return forbidden("Limit alias tercapai");
+          if ((Number(cnt?.c ?? 0)) >= me.alias_limit) return forbidden("Limit alias tercapai");
 
           const t = nowSec();
           try {
@@ -1686,6 +1407,7 @@ export default {
           } catch (e) {
             const msg = String(e && e.message ? e.message : e);
             if (msg.toUpperCase().includes("UNIQUE")) return badRequest("Alias sudah dipakai");
+            console.log("alias db error:", msg);
             return json({ ok: false, error: "DB error" }, 500);
           }
 
@@ -1716,6 +1438,7 @@ export default {
           const alias = (url.searchParams.get("alias") || "").trim().toLowerCase();
           if (!alias || !validLocalPart(alias)) return badRequest("alias required");
 
+          // check ownership
           const own = await env.DB.prepare(
             `SELECT local_part FROM aliases WHERE local_part = ? AND user_id = ? AND disabled = 0`
           )
@@ -1746,7 +1469,6 @@ export default {
             .first();
 
           if (!row) return notFound();
-
           return json({ ok: true, email: row });
         }
 
@@ -1779,9 +1501,9 @@ export default {
              FROM users ORDER BY created_at DESC LIMIT 200`
           ).all();
 
-          const users = (rows.results || []).map(u => ({
+          const users = (rows.results || []).map((u) => ({
             ...u,
-            created_at: new Date(u.created_at * 1000).toISOString()
+            created_at: new Date(u.created_at * 1000).toISOString(),
           }));
 
           return json({ ok: true, users });
@@ -1793,10 +1515,15 @@ export default {
           const body = await readJson(request);
           if (!body) return badRequest("JSON required");
 
-          const alias_limit = body.alias_limit !== undefined ? safeInt(body.alias_limit, NaN) : undefined;
-          const disabled = body.disabled !== undefined ? safeInt(body.disabled, NaN) : undefined;
+          const alias_limit =
+            body.alias_limit !== undefined ? safeInt(body.alias_limit, NaN) : undefined;
+          const disabled =
+            body.disabled !== undefined ? safeInt(body.disabled, NaN) : undefined;
 
-          if (alias_limit !== undefined && (!Number.isFinite(alias_limit) || alias_limit < 0 || alias_limit > 1000)) {
+          if (
+            alias_limit !== undefined &&
+            (!Number.isFinite(alias_limit) || alias_limit < 0 || alias_limit > 1000)
+          ) {
             return badRequest("alias_limit invalid");
           }
           if (disabled !== undefined && !(disabled === 0 || disabled === 1)) {
@@ -1805,8 +1532,14 @@ export default {
 
           const sets = [];
           const binds = [];
-          if (alias_limit !== undefined) { sets.push("alias_limit = ?"); binds.push(alias_limit); }
-          if (disabled !== undefined) { sets.push("disabled = ?"); binds.push(disabled); }
+          if (alias_limit !== undefined) {
+            sets.push("alias_limit = ?");
+            binds.push(alias_limit);
+          }
+          if (disabled !== undefined) {
+            sets.push("disabled = ?");
+            binds.push(disabled);
+          }
           if (sets.length === 0) return badRequest("No fields");
 
           binds.push(userId);
@@ -1819,9 +1552,9 @@ export default {
         }
 
         return notFound();
-      } catch (err) {
-        console.log("api error:", err?.message || String(err));
-        return json({ ok: false, error: String(err && err.message ? err.message : err) }, 500);
+      } catch (e) {
+        console.log("API ERROR:", e && e.stack ? e.stack : e);
+        return json({ ok: false, error: "Server error" }, 500);
       }
     }
 
@@ -1839,6 +1572,7 @@ export default {
         return;
       }
 
+      // Lookup alias + user
       const row = await env.DB.prepare(
         `SELECT a.local_part as local_part, a.user_id as user_id, a.disabled as alias_disabled,
                 u.disabled as user_disabled
@@ -1860,9 +1594,10 @@ export default {
         return;
       }
 
-      const parser = new PostalMime.default();
       const rawEmail = new Response(message.raw);
       const ab = await rawEmail.arrayBuffer();
+
+      const parser = new PostalMime();
       const parsed = await parser.parse(ab);
 
       const id = crypto.randomUUID();
@@ -1870,7 +1605,8 @@ export default {
 
       const subject = parsed.subject || "";
       const date = parsed.date ? new Date(parsed.date).toISOString() : "";
-      const fromAddr = (parsed.from && parsed.from.address) ? parsed.from.address : (message.from || "");
+      const fromAddr =
+        (parsed.from && parsed.from.address) ? parsed.from.address : (message.from || "");
       const toAddr = message.to || "";
 
       const maxTextChars = safeInt(env.MAX_TEXT_CHARS, 200000);
@@ -1907,9 +1643,8 @@ export default {
           t
         )
         .run();
-
     } catch (e) {
-      console.log("email handler error:", e && e.message ? e.message : e);
+      console.log("email handler error:", e && e.stack ? e.stack : e);
       message.setReject("Temporary processing error");
     }
   },

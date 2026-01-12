@@ -969,7 +969,7 @@ const PAGES = {
             const note = document.createElement('div');
             note.className = 'muted';
             note.style.marginTop = '10px';
-            note.textContent = 'HTML ditampilkan aman (sandbox).';
+            note.textContent = 'HTML ditampilkan';
             body.appendChild(note);
           } else {
             const box = document.createElement('div');
